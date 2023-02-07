@@ -1,0 +1,3 @@
+for M in  '.0' '.75' '.8' '.85' '.9' '.95'; do for N in 4; do python3 train_inpt_spikingjelly.py --workdir=../../tcja_seq_${M}_${N}_t1 --config=tcja/configs/prune_quant_seq.py --config.quant.prune_percentage=${M} --config.quant.bits=${N}; done; done
+
+for M in  '.0' '.75' '.8' '.85' '.9' '.95'; do for N in 4; do python3 train_inpt_spikingjelly.py --workdir=../../tcja_joint_${M}_${N}_t1 --config=tcja/configs/prune_quant_joint.py --config.quant.prune_percentage=${M} --config.quant.bits=${N}; done; done
