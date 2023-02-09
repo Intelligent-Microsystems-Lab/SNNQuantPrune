@@ -207,21 +207,6 @@ def cross_entropy_loss(logits, labels, smoothing=0):
   return xentropy
 
 
-def decolle_loss(logits, labels, smoothing=0, T=1):
-  one_hot_labels = common_utils.onehot(labels, num_classes=logits.shape[1])
-
-  factor = smoothing
-  one_hot_labels *= 1 - factor
-  one_hot_labels += factor / one_hot_labels.shape[1]
-
-  # smooth L1 loss
-  smoothl1 = jnp.mean(
-      optax.huber_loss(predictions=logits / T, targets=one_hot_labels)
-  )
-
-  return smoothl1
-
-
 def mse_loss(logits, labels, smoothing=0, T=1):
   one_hot_labels = common_utils.onehot(labels, num_classes=logits.shape[1])
 
