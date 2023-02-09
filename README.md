@@ -1,6 +1,8 @@
 # Quantization and Pruning for SNNs
 
-Code for the ISCAS23 paper "The Hardware Impact of Quantization and Pruning for Weights in Spiking Neural Networks" by Clemens JS Schaefer, Pooria Taheri, Mark Horeni, and Siddharth Joshi.
+Code for the ISCAS23/TCAS-II paper "The Hardware Impact of Quantization and Pruning for Weights in Spiking Neural Networks" by Clemens JS Schaefer, Pooria Taheri, Mark Horeni, and Siddharth Joshi.
+
+https://arxiv.org/abs/2302.04174
 
 To run training:
 
