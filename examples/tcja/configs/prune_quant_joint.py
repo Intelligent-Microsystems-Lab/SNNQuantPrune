@@ -59,7 +59,7 @@ def get_config():
   config.quant.prune_global = True
   config.quant.prune_percentage = .3
 
-  config.pretrained = '../data/tcja_test/checkpoint_max.pth'
+  config.pretrained = None #'../data/tcja_test/checkpoint_max.pth'
 
   # If num_train_steps==-1 then the number of training steps is calculated from
   # num_epochs using the entire dataset. Similarly for steps_per_eval.

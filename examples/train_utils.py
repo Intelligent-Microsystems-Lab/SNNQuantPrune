@@ -67,7 +67,7 @@ def create_learning_rate_fn(
         ]
         * math.ceil(config.num_epochs / config.t_max)
     )
-  elif config.quant.start_epoch > 0:
+  elif hasattr(config.quant, 'start_epoch'):
     num_e1 = config.quant.start_epoch
     cosine_epochs1 = max(num_e1 - config.warmup_epochs, 1)
     cosine_fn1 = optax.cosine_decay_schedule(

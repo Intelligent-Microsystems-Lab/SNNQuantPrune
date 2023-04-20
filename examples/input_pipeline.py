@@ -237,6 +237,8 @@ Returns:
     base_size = 34
   elif config.dataset == "asl_dvs_tfds":
     base_size = 240
+  elif config.dataset == 'mnist':
+    base_size = 28
   else:
     raise Exception("Unknown dataset: " + config.dataset)
 
@@ -281,13 +283,28 @@ Returns:
         "label": tf.cast(example["label"], tf.int8),
     }
 
-  ds = dataset_builder.as_dataset(
-      split=split,
-      decoders={
-          "addrs": tfds.decode.SkipDecoding(),
-          "times": tfds.decode.SkipDecoding(),
-      },
-  )
+  def decode_mnist(example):
+    
+    # normalize
+    x = tf.cast(example["image"], tf.float16)
+    x = ((x/255) - 0.1307) / 0.3081
+    
+    # poisson encoding
+    return {
+        "dvs_matrix": tf.random.poisson([config.num_frames], x),
+        "label": tf.cast(example["label"], tf.int8),
+    }
+
+  if config.dataset == 'mnist':
+    ds = dataset_builder.as_dataset(split=split)
+  else:
+    ds = dataset_builder.as_dataset(
+        split=split,
+        decoders={
+            "addrs": tfds.decode.SkipDecoding(),
+            "times": tfds.decode.SkipDecoding(),
+        },
+    )
 
   # Debug
   # test  = next(iter(ds))
@@ -305,9 +322,12 @@ Returns:
     ds = ds.repeat()
     ds = ds.shuffle(16 * config.batch_size // jax.process_count(), seed=0)
 
-  ds = ds.map(
-      decode_example, num_parallel_calls=tf.data.experimental.AUTOTUNE
-  )
+  if config.dataset == 'mnist':
+    ds = ds.map(decode_mnist, num_parallel_calls=tf.data.experimental.AUTOTUNE)
+  else:
+    ds = ds.map(
+        decode_example, num_parallel_calls=tf.data.experimental.AUTOTUNE
+    )
   if train:
     ds = ds.batch(
         config.batch_size // jax.process_count(), drop_remainder=True

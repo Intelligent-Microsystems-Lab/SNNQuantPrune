@@ -6,7 +6,6 @@
 The data is loaded using tensorflow_datasets.
 """
 
-
 import functools
 import subprocess
 import time
@@ -23,24 +22,23 @@ from flax import jax_utils
 from flax.training import common_utils
 
 import jax
-# import optax
 from jax import random
 
 import tensorflow as tf
+import tensorflow_datasets as tfds
 
 import numpy as np
 import jax.numpy as jnp
 
-import models
 
-from torch.utils.data import DataLoader
+import models
 
 import ml_collections
 from ml_collections import config_flags
 
-from spikingjelly.datasets.dvs128_gesture import DVS128Gesture
-
-from train_utils import (
+import sys
+sys.path.append("..")
+from train_utils import (  # noqa: E402
     TrainState,
     restore_checkpoint,
     save_checkpoint,
@@ -51,9 +49,9 @@ from train_utils import (
     eval_step,
     sync_batch_stats,
 )
+import input_pipeline  # noqa: E402
 
 
-# Config updates for debuggin.
 # from jax.config import config
 # config.update("jax_debug_nans", True)
 # config.update("jax_disable_jit", True)
@@ -80,12 +78,16 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     Final TrainState.
   """
 
+  # config.unlock()
+  # config.num_frames = int(config.train_chunk_size / config.time_step)
+  # config.lock()
+
   writer_train = metric_writers.create_default_writer(
       logdir=workdir + '/train', just_logging=jax.process_index() != 0)
   writer_eval = metric_writers.create_default_writer(
       logdir=workdir + '/eval', just_logging=jax.process_index() != 0)
 
-  logging.get_absl_handler().use_absl_log_file('absl_logging', FLAGS.workdir)
+  # logging.get_absl_handler().use_absl_log_file('absl_logging', FLAGS.workdir)
   logging.info('Git commit: ' + subprocess.check_output(
       ['git', 'rev-parse', 'HEAD']).decode('ascii').strip())
   logging.info(config)
@@ -96,137 +98,60 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     raise ValueError('Batch size (' + str(config.batch_size) + ') must be \
       divisible by the number of devices (' + str(jax.device_count()) + ').')
 
-  train_set = DVS128Gesture('/afs/crc.nd.edu/user/c/cschaef6/datasets/DVS128Gesture', train=True,
-                            data_type='frame', split_by='number',
-                            frames_number=config.num_frames)
-  test_set = DVS128Gesture('/afs/crc.nd.edu/user/c/cschaef6/datasets/DVS128Gesture', train=False,
-                           data_type='frame', split_by='number',
-                           frames_number=config.num_frames)
+  # Load Data
+  dataset_builder = tfds.builder(config.dataset, data_dir=config.tfds_data_dir)
+  dataset_builder.download_and_prepare()
 
-  train_iter = DataLoader(
-      dataset=train_set,
-      batch_size=config.batch_size,
-      shuffle=True,
-      num_workers=16,
-      drop_last=True,
-      pin_memory=True)
-
-  eval_iter = DataLoader(
-      dataset=test_set,
-      batch_size=config.eval_batch_size,
-      shuffle=False,
-      num_workers=16,
-      drop_last=False,
-      pin_memory=True)
+  train_iter = input_pipeline.create_input_iter(
+      dataset_builder, config, train=True, cache=config.cache)
+  eval_iter = input_pipeline.create_input_iter(
+      dataset_builder, config, train=False, cache=config.cache)
 
   dev_num = config.num_devices if 'num_devices' in config else\
       jax.local_device_count()
 
-  steps_per_checkpoint = 10
+  steps_per_epoch = (
+      dataset_builder.info.splits['train'].num_examples // config.batch_size
+  )
+
+  if config.num_train_steps == -1:
+    num_steps = int(steps_per_epoch * config.num_epochs)
+  else:
+    num_steps = config.num_train_steps
+
+  if config.steps_per_eval == -1:
+    num_validation_examples = dataset_builder.info.splits['test'].num_examples
+    steps_per_eval = num_validation_examples // config.eval_batch_size
+  else:
+    steps_per_eval = config.steps_per_eval
+
+  steps_per_checkpoint = steps_per_epoch * 10
 
   base_learning_rate = config.learning_rate
   model_dtype = config.dtype if 'dtype' in config else jnp.float32
 
   model_cls = getattr(models, config.model)
+  # if 'partial' not in model_cls.__doc__:
+  #   # raw res conv net for network sweeps
+  #   model_cls = functools.partial(model_cls, depth=config.depth,
+  #                                 width=config.width,
+  #                                 num_compartments=config.num_compartments)
 
   model = create_model(
       model_cls=model_cls, num_classes=config.num_classes,
       model_dtype=model_dtype, config=config)
 
   learning_rate_fn = create_learning_rate_fn(
-      config, base_learning_rate, len(train_set.samples) // config.batch_size)
+      config, base_learning_rate, steps_per_epoch
+      * (config.num_frames if 'online' in config else 1.))
 
-  image_size = next(iter(train_iter))[0].shape[-2]
+  image_size = next(train_iter)['dvs_matrix'].shape[-2]
   rng, subkey = jax.random.split(rng, 2)
   state = create_train_state(
       subkey, config, model, image_size, learning_rate_fn)
 
   if config.pretrained:
     state = model.load_model_fn(state, config.pretrained)
-
-    def update_prune_mask(x):
-      if type(x) is not dict:
-        return x
-      else:
-        mask = np.ones(x['kernel'].shape)
-        k = int(np.prod(x['kernel'].shape) * config.prune_percentage)
-        idx = np.argpartition(np.abs(x['kernel']).reshape(-1), k)[:k]
-        mask.reshape(-1)[idx] = 0
-
-        return {'prune_0': {'mask': jnp.array(mask)}, 'kernel': x['kernel'],
-                'DuQ_0': x['DuQ_0']}
-
-    def update_quant_params(x):
-      if type(x) is not dict:
-        return x
-      else:
-        return {'DuQ_0': {'a':
-                          jnp.array((config.quant.init_fn(
-                              x['kernel'], bits=config.quant.bits, sign=True),
-                          )),
-                          'c':
-                          jnp.array((config.quant.init_fn(
-                              x['kernel'], bits=config.quant.bits, sign=True),
-                          ))},
-                'prune_0': x['prune_0'],
-                'kernel': x['kernel']}
-
-    global_weights = []
-    global global_mask
-
-    def create_global_weights(x):
-      if type(x) is not dict:
-        return x
-      else:
-        global_weights.append(x['kernel'])
-        return x
-
-    def get_global_mask(x):
-      if type(x) is not dict:
-        return x
-      else:
-        global global_mask
-        local_mask = global_mask[:np.prod(x['kernel'].shape)]
-        global_mask = global_mask[np.prod(x['kernel'].shape):]
-        return {'prune_0': {'mask': jnp.reshape(local_mask,
-                                                x['kernel'].shape)},
-                'DuQ_0': x['DuQ_0'],
-                'kernel': x['kernel']}
-
-    def check_quant_obj(x):
-      if type(x) is not dict:
-        return True
-      if 'kernel' in x.keys():
-        return True
-      return False
-
-    if config.quant.prune_percentage > 0.:
-      # pruning local - layerwise
-      if config.quant.prune_global is False:
-        state.params['params'] = jax.tree_map(
-            update_prune_mask, state.params['params'], is_leaf=check_quant_obj)
-      # pruning global
-      if config.quant.prune_global is True:
-        _ = jax.tree_map(
-            create_global_weights, state.params['params'],
-            is_leaf=check_quant_obj)
-
-        tmp_gw = jnp.concatenate([jnp.reshape(x, (-1))
-                                  for x in global_weights])
-
-        global_mask = np.ones(tmp_gw.shape)
-        k = int(np.prod(tmp_gw.shape) * config.quant.prune_percentage)
-        idx = np.argpartition(np.abs(tmp_gw), k)[:k]
-        global_mask[idx] = 0
-
-        state.params['params'] = jax.tree_map(
-            get_global_mask, state.params['params'], is_leaf=check_quant_obj)
-
-    if config.quant.start_epoch == -1:
-      logging.info('Quantization start.')
-      state.params['params'] = jax.tree_map(
-          update_quant_params, state.params['params'], is_leaf=check_quant_obj)
-
     logging.info('Successfully restored model from: ' + config.pretrained)
 
   state = restore_checkpoint(state, workdir)
@@ -238,6 +163,30 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
       jax.tree_util.tree_map(lambda x: jnp.prod(jnp.array(x.shape)),
                              state.params))[0]))
   logging.info('Total number of parameters: ' + str(total_num_params))
+
+  # Log number of FLOPS
+  @jax.jit
+  def fwd_pass_model(weights, batch_stats, inputs):
+    variables = {'params': weights,
+                 'batch_stats': batch_stats, }
+    (logits, _), _ = state.apply_fn(
+        variables,
+        inputs,
+        trgt=None,
+        train=False,
+        online=False,
+        rng=random.PRNGKey(0),
+        mutable=['batch_stats'],
+        rngs={'dropout': random.PRNGKey(0)},
+    )
+    return logits
+
+  m = jax.xla_computation(fwd_pass_model)(state.params['params'],
+                                          state.batch_stats, jnp.ones(
+      (1, config.num_frames, 28, 28, 2))).as_hlo_module()
+  client = jax.lib.xla_bridge.get_backend()
+  cost = jax.lib.xla_client._xla.hlo_module_cost_analysis(client, m)
+  logging.info('Total number of FLOPs (fwd): ' + str(cost['flops']))
 
   state = jax_utils.replicate(state, devices=jax.devices(
   )[:config.num_devices] if 'num_devices' in config else jax.devices())
@@ -294,22 +243,13 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
 
   # evaluate model before training
   eval_metrics = []
-  for frame, label in eval_iter:
+  for _ in range(steps_per_eval):
     rng_list = jax.random.split(rng, dev_num + 1)
     rng = rng_list[0]
-    eval_batch = {'dvs_matrix': jnp.reshape(jnp.transpose(frame.numpy(),
-                                                          (0, 1, 3, 4, 2)),
-                                            (config.num_devices, -1,
-                                             config.num_frames, image_size,
-                                             image_size, 2)), 'label':
-                  jnp.reshape(label.numpy(), (config.num_devices, -1))}
 
+    eval_batch = next(eval_iter)
     metrics = p_eval_step(state, eval_batch, rng_list[1:])
     eval_metrics.append(metrics)
-
-  logging.info('density:')
-  logging.info(jax.tree_map(lambda x: jnp.sum(x != 0)
-                            / np.prod(x.shape), state.params['params']))
 
   eval_metrics = common_utils.stack_forest(eval_metrics)
   summary = jax.tree_map(lambda x: x.mean(), eval_metrics)
@@ -324,36 +264,15 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
     hooks += [periodic_actions.Profile(num_profile_steps=5, logdir=workdir)]
   train_metrics_last_t = time.time()
   logging.info('Initial compilation, this might take some minutes...')
-  for step in range(config.num_epochs):
+  for step, batch in zip(range(step_offset, num_steps), train_iter):
+    rng_list = jax.random.split(rng, dev_num + 1)
+    rng = rng_list[0]
+    state, metrics = p_train_step(state, batch, rng_list[1:])
 
-    if step == config.quant.start_epoch:
-      if 'DuQ' in str(config.quant.weight):
-        logging.info('Quantization start.')
-        state = jax_utils.unreplicate(state)
-        # quantization
-        state.params['params'] = jax.tree_map(
-            update_quant_params, state.params['params'],
-            is_leaf=check_quant_obj)
-        state = jax_utils.replicate(state, devices=jax.devices(
-        )[:config.num_devices] if 'num_devices' in config else jax.devices())
-
-    for frame, label in train_iter:
-
-      rng_list = jax.random.split(rng, dev_num + 1)
-      rng = rng_list[0]
-
-      batch = {'dvs_matrix': jnp.reshape(jnp.transpose(frame.numpy(),
-                                                       (0, 1, 3, 4, 2)),
-                                         (config.num_devices, -1,
-                                          config.num_frames, image_size,
-                                          image_size, 2)), 'label':
-               jnp.reshape(label.numpy(), (config.num_devices, -1))}
-
-      state, metrics = p_train_step(state, batch, rng_list[1:])
-      # # Debug
-      # state, metrics = p_train_step(
-      #     state, {'dvs_matrix': batch['dvs_matrix'][0, :, :, :, :, :],
-      #             'label': batch['label'][0]}, rng_list[2])
+    # # Debug
+    # state, metrics = p_train_step(
+    #     state, {'dvs_matrix': batch['dvs_matrix'][0, :, :, :, :, :],
+    #             'label': batch['label'][0]}, rng_list[2])
 
     for h in hooks:
       h(step)
@@ -370,55 +289,51 @@ def train_and_evaluate(config: ml_collections.ConfigDict,
         }
         summary['steps_per_second'] = config.log_every_steps / (
             time.time() - train_metrics_last_t)
-        summary['epoch'] = step
         writer_train.write_scalars(step + 1, summary)
         writer_train.flush()
         train_metrics = []
         train_metrics_last_t = time.time()
 
-    eval_metrics = []
-    # sync batch statistics across replicas
-    state = sync_batch_stats(state)
-    eval_latency = []
-    for frame, label in eval_iter:
-      rng_list = jax.random.split(rng, dev_num + 1)
-      rng = rng_list[0]
-      eval_batch = {'dvs_matrix': jnp.reshape(jnp.transpose(frame.numpy(),
-                                                            (0, 1, 3, 4, 2)), (
-          config.num_devices, -1, config.num_frames, image_size, image_size,
-          2)),
-          'label': jnp.reshape(label.numpy(), (config.num_devices, -1))}
-      start_t = time.time()
-      metrics = p_eval_step(state, eval_batch, rng_list[1:])
-      eval_latency.append(time.time() - start_t)
-      eval_metrics.append(metrics)
+    if (step + 1) % steps_per_epoch == 0:
+      epoch = (step + 1) // steps_per_epoch
+      eval_metrics = []
 
-    # discard first latency - commpile time...
-    latency = np.mean(eval_latency[1:])
-    eval_metrics = common_utils.stack_forest(eval_metrics)
-    summary = jax.tree_map(lambda x: x.mean(), eval_metrics)
-    logging.info('eval epoch: %d, loss: %.4f, accuracy: %.2f',
-                 step, summary['loss'], summary['accuracy'] * 100)
-    writer_eval.write_scalars(
-        step + 1, {f'{key}': val for key, val in summary.items()})
-    writer_eval.flush()
-    if summary['accuracy'] > eval_best and step > config.quant.start_epoch:
-      save_checkpoint(state, workdir + '/best')
-      logging.info('!!!! Saved new best model with accuracy %.4f',
-                   summary['accuracy'])
-      eval_best = summary['accuracy']
+      # sync batch statistics across replicas
+      state = sync_batch_stats(state)
+      eval_latency = []
+      for _ in range(steps_per_eval):
+        rng_list = jax.random.split(rng, dev_num + 1)
+        rng = rng_list[0]
 
-    if (step + 1) % steps_per_checkpoint == 0:
+        eval_batch = next(eval_iter)
+        start_t = time.time()
+        metrics = p_eval_step(state, eval_batch, rng_list[1:])
+        eval_latency.append(time.time() - start_t)
+        eval_metrics.append(metrics)
+
+      # discard first latency - commpile time...
+      latency = np.mean(eval_latency[1:])
+      eval_metrics = common_utils.stack_forest(eval_metrics)
+      summary = jax.tree_map(lambda x: x.mean(), eval_metrics)
+      logging.info('eval epoch: %d, loss: %.4f, accuracy: %.2f',
+                   epoch, summary['loss'], summary['accuracy'] * 100)
+      writer_eval.write_scalars(
+          step + 1, {f'{key}': val for key, val in summary.items()})
+      writer_eval.flush()
+      if summary['accuracy'] > eval_best:
+        save_checkpoint(state, workdir + '/best')
+        logging.info('!!!! Saved new best model with accuracy %.4f',
+                     summary['accuracy'])
+        eval_best = summary['accuracy']
+
+    if (step + 1) % steps_per_checkpoint == 0 or step + 1 == num_steps:
       state = sync_batch_stats(state)
       save_checkpoint(state, workdir)
-
-  logging.info('density:')
-  logging.info(jax.tree_map(lambda x: jnp.sum(x != 0)
-                            / np.prod(x.shape), state.params['params']))
 
   # Wait until computations are done before exiting
   jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
 
+  # logging.info('Total number of FLOPs (fwd): ' + str(cost['flops']))
   logging.info('Total number of parameters: ' + str(total_num_params))
   logging.info('Best accuracy: %.4f with latency %.4f', eval_best, latency)
   return state

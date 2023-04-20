@@ -30,7 +30,7 @@ from jax._src.lax.lax import (
 
 from flax.linen.module import Module, compact
 from flax.linen.linear import (
-    zeros,
+    initializers,
     default_kernel_init,
     PRNGKey,
     Shape,
@@ -84,7 +84,7 @@ class QuantConv(Module):
   dtype: Dtype = jnp.float32
   precision: Any = None
   kernel_init: Callable[[PRNGKey, Shape, Dtype], Array] = default_kernel_init
-  bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = zeros
+  bias_init: Callable[[PRNGKey, Shape, Dtype], Array] = initializers.zeros_init()
   config: dict = None
   bits: int = 8
   quant_act_sign: bool = True
